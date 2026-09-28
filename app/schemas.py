@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -18,8 +19,10 @@ from app.policy import (
     _parse_reverse_cidr,
     _validate_reverse_batch,
     as_relationship_token,
+    nat64_codec,
     parse_address,
     parse_key_hex,
+    parse_nat64_prefix,
     parse_network,
     parse_strict_cidr,
 )
@@ -957,4 +960,85 @@ class AsRelationshipRepairResponse(BaseModel):
     )
     changes: int = Field(
         description="Number of relationships changed (len(corrections)).",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /nat64-codec
+# ---------------------------------------------------------------------------
+
+
+class Nat64CodecRequest(BaseModel):
+    prefix: str = Field(
+        description=(
+            "Strict IPv6 Network-Specific Prefix for the RFC 6052 mapping, "
+            "with an explicit length. Only /32, /40, /48, /56, /64 and /96 "
+            "are accepted; host bits must be zero."
+        ),
+    )
+    encode: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bare IPv4 addresses to embed into the prefix, in response order."
+        ),
+    )
+    decode: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Bare IPv6 addresses to reverse-map, in response order. Each must "
+            "be a canonical RFC 6052 mapping for the prefix (the u octet and "
+            "remaining suffix zero); any non-canonical entry rejects the "
+            "whole request."
+        ),
+    )
+
+    @field_validator("prefix")
+    @classmethod
+    def _validate_prefix(cls, value: str) -> str:
+        # A ValueError raised here is turned by FastAPI into an HTTP 422
+        # response carrying the offending field and value.
+        parse_nat64_prefix(value)
+        return value
+
+    @field_validator("encode")
+    @classmethod
+    def _validate_encode_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            address = parse_address(value)
+            if not isinstance(address, ipaddress.IPv4Address):
+                raise ValueError(
+                    f"encode entry {value!r} must be an IPv4 address, not IPv6"
+                )
+        return values
+
+    @field_validator("decode")
+    @classmethod
+    def _validate_decode_list(cls, values: list[str]) -> list[str]:
+        for value in values:
+            address = parse_address(value)
+            if not isinstance(address, ipaddress.IPv6Address):
+                raise ValueError(
+                    f"decode entry {value!r} must be an IPv6 address, not IPv4"
+                )
+        return values
+
+    @model_validator(mode="after")
+    def _validate_canonical_mappings(self) -> "Nat64CodecRequest":
+        # Prefix membership and the zero u octet/suffix checks span the prefix
+        # and the decode entries, so they belong to the whole-model validator;
+        # the ValueError becomes an HTTP 422 like the other batch endpoints.
+        nat64_codec(self.prefix, self.encode, self.decode)
+        return self
+
+
+class Nat64CodecResponse(BaseModel):
+    encoded: list[str] = Field(
+        description=(
+            "RFC 6052 IPv6 mappings, one per encode entry, in input order."
+        ),
+    )
+    decoded: list[str] = Field(
+        description=(
+            "Embedded IPv4 addresses, one per decode entry, in input order."
+        ),
     )

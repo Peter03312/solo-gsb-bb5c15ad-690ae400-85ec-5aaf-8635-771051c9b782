@@ -2208,3 +2208,249 @@ def test_as_relationship_repair_is_documented_in_openapi():
     assert correction_schema["properties"]["type"]["enum"] == [
         "customer_provider", "peer",
     ]
+
+
+# --------------------------------------------------------------------------
+# POST /nat64-codec
+# --------------------------------------------------------------------------
+
+
+def test_nat64_codec_slash96_well_known_prefix():
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "64:ff9b::/96",
+            "encode": ["192.0.2.1", "10.0.0.1"],
+            "decode": ["64:ff9b::c000:202", "64:ff9b::a00:1"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "encoded": ["64:ff9b::c000:201", "64:ff9b::a00:1"],
+        "decoded": ["192.0.2.2", "10.0.0.1"],
+    }
+
+
+@pytest.mark.parametrize(
+    "prefix,ipv4,ipv6",
+    [
+        ("2001:db8::/32",       "192.0.2.1", "2001:db8:c000:201::"),
+        ("2001:db8:100::/40",   "192.0.2.1", "2001:db8:1c0:2:100::"),
+        ("2001:db8:1::/48",     "192.0.2.1", "2001:db8:1:c000:201::"),
+        ("2001:db8:1:200::/56", "192.0.2.1", "2001:db8:1:2c0:2:100::"),
+        ("2001:db8:1:2::/64",   "192.0.2.1", "2001:db8:1:2:c000:201::"),
+        ("64:ff9b::/96",        "192.0.2.1", "64:ff9b::c000:201"),
+    ],
+)
+def test_nat64_codec_roundtrips_every_allowed_prefix(prefix, ipv4, ipv6):
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": prefix, "encode": [ipv4], "decode": [ipv6]},
+    )
+    assert response.status_code == 200, (prefix, response.json())
+    assert response.json() == {"encoded": [ipv6], "decoded": [ipv4]}
+
+
+def test_nat64_codec_slash64_bridges_the_64_bit_boundary():
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8:1:2::/64",
+            "encode": ["10.0.0.1", "198.51.100.7"],
+            "decode": ["2001:db8:1:2:c633:6407::"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "encoded": [
+            "2001:db8:1:2:a00:1::",
+            "2001:db8:1:2:c633:6407::",
+        ],
+        "decoded": ["198.51.100.7"],
+    }
+
+
+def test_nat64_codec_preserves_input_order_and_lengths():
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8::/32",
+            "encode": ["10.0.0.1", "192.0.2.1", "255.255.255.255"],
+            "decode": [
+                "2001:db8:c000:201::",
+                "2001:db8:a00:1::",
+                "2001:db8:ffff:ffff::",
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["encoded"] == [
+        "2001:db8:a00:1::",
+        "2001:db8:c000:201::",
+        "2001:db8:ffff:ffff::",
+    ]
+    assert data["decoded"] == ["192.0.2.1", "10.0.0.1", "255.255.255.255"]
+    assert len(data["encoded"]) == 3
+    assert len(data["decoded"]) == 3
+
+
+def test_nat64_codec_empty_batch():
+    response = client.post(
+        "/nat64-codec", json={"prefix": "64:ff9b::/96"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"encoded": [], "decoded": []}
+
+
+def test_nat64_codec_non_zero_u_octet_returns_422():
+    # u octet (bits 24..31 of the /64 mapping) non-zero, suffix still zero.
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8:1:2::/64",
+            "encode": ["10.0.0.1"],
+            "decode": ["2001:db8:1:2:c000:201:ab00:0"],
+        },
+    )
+    assert response.status_code == 422
+    assert "u octet" in response.json()["detail"][0]["msg"]
+
+
+def test_nat64_codec_non_zero_suffix_returns_422():
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8:1:2::/64",
+            "decode": ["2001:db8:1:2:c000:201::1"],
+        },
+    )
+    assert response.status_code == 422
+    assert "suffix" in response.json()["detail"][0]["msg"]
+
+
+def test_nat64_codec_address_outside_prefix_returns_422():
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "decode": ["2001:db8::c000:201"]},
+    )
+    assert response.status_code == 422
+    assert "not inside" in response.json()["detail"][0]["msg"]
+
+
+@pytest.mark.parametrize("bad_prefix", [
+    "2001:db8::/31",
+    "2001:db8::/33",
+    "2001:db8::/63",
+    "2001:db8::/65",
+    "2001:db8::/95",
+    "2001:db8::/97",
+    "2001:db8::/120",
+    "2001:db8::",
+    "2001:db8::1/64",
+    "10.0.0.0/32",
+    "bogus",
+])
+def test_nat64_codec_bad_prefix_returns_422(bad_prefix):
+    response = client.post(
+        "/nat64-codec", json={"prefix": bad_prefix, "encode": [], "decode": []}
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "prefix" for err in response.json()["detail"])
+
+
+def test_nat64_codec_missing_prefix_returns_422():
+    response = client.post("/nat64-codec", json={"encode": ["10.0.0.1"]})
+    assert response.status_code == 422
+    assert any("prefix" in err["loc"] for err in response.json()["detail"])
+
+
+def test_nat64_codec_encode_wrong_family_returns_422():
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "encode": ["2001:db8::1"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "encode" for err in response.json()["detail"])
+
+
+def test_nat64_codec_decode_wrong_family_returns_422():
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "decode": ["10.0.0.1"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "decode" for err in response.json()["detail"])
+
+
+def test_nat64_codec_invalid_entries_and_cidr_notation_return_422():
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "encode": ["bogus"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "encode" for err in response.json()["detail"])
+
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "encode": ["10.0.0.1/32"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "encode" for err in response.json()["detail"])
+
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "decode": ["64:ff9b::1/96"]},
+    )
+    assert response.status_code == 422
+    assert any(err["loc"][-1] == "decode" for err in response.json()["detail"])
+
+
+def test_nat64_codec_wrong_types_return_422():
+    response = client.post(
+        "/nat64-codec", json={"prefix": 10, "encode": [], "decode": []}
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "64:ff9b::/96", "encode": [10]},
+    )
+    assert response.status_code == 422
+
+
+def test_nat64_codec_non_canonical_decoding_rejects_whole_batch():
+    # The encode list is valid, but one non-canonical decode entry must
+    # reject the whole request without any partial result.
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8:1:2::/64",
+            "encode": ["10.0.0.1"],
+            "decode": ["2001:db8:1:2:c633:6407::ffff"],
+        },
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert "encoded" not in body
+    assert "decoded" not in body
+    assert body["detail"][0]["loc"] == ["body"]
+
+
+def test_nat64_codec_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/nat64-codec" in spec["paths"]
+    operation = spec["paths"]["/nat64-codec"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "slash96_well_known_prefix" in examples
+    assert "slash64_u_octet_and_suffix" in examples
+    assert "non_canonical_u_octet_rejected" in examples
+    response_examples = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert "slash64_u_octet_and_suffix" in response_examples
+    schema = spec["components"]["schemas"]["Nat64CodecResponse"]
+    assert set(schema["properties"]) == {"encoded", "decoded"}

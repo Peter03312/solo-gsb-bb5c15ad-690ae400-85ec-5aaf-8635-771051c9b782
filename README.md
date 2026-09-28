@@ -8,8 +8,9 @@
 （`/audit-rules`）、策略最小化（`/minimize-policy`）、子网分配
 （`/allocate`）、地址/网段密钥脱敏（`/anonymize`）、同一 `/24` 内
 IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）、单个 scope 内
-拟发布路由的 RPKI ROA 覆盖状态分区（`/roa-coverage`）以及无向 AS 关系的
-无谷路径修复（`/as-relationship-repair`）接口。
+拟发布路由的 RPKI ROA 覆盖状态分区（`/roa-coverage`）、无向 AS 关系的
+无谷路径修复（`/as-relationship-repair`）以及按 **RFC 6052** 在 IPv6
+Network-Specific Prefix 内嵌入 IPv4 的编码/解码（`/nat64-codec`）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -40,6 +41,12 @@ IPv4 网段的反向 DNS 委派计划（`/reverse-delegations`）、单个 scope
   「上行\*、至多一次对等、下行\*」的**无谷（valley-free）规则**；同一关系
   在各路径中**共用同一个修正结果**，同分按 AS 对排序后的**新关系序列
   字典序**取唯一方案，无可行方案返回 **HTTP 409**；
+- `/nat64-codec` 按 **RFC 6052** 在一个严格 IPv6 翻译前缀（Network-Specific
+  Prefix，仅允许 **/32、/40、/48、/56、/64、/96**）内批量**编码**裸 IPv4
+  地址、批量**解码**规范 IPv6 映射：/32～/64 时 IPv4 的 32 位跨在第 64 位
+  边界前后，其后的 **u 八位与剩余后缀全部置零**；/96 时 IPv4 直接接在
+  前缀之后。解码逐地址校验**前缀归属、u 八位、剩余后缀**，任一非法地址或
+  非规范映射**整批返回 422**；编码、解码结果分别与输入等长且保持原顺序；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
 ## 一条命令启动
@@ -960,6 +967,109 @@ curl -i -X POST http://localhost:8000/as-relationship-repair \
 ASN 非整数（含布尔值）或超出 32 位范围；同一 AS 对重复给出关系（冲突）；
 路径为空、路径内 AS 重复，或某一跳的 AS 对没有任何关系。
 
+### `POST /nat64-codec`
+
+按 **RFC 6052**（IPv6/IPv4 地址翻译）在一个严格 IPv6 翻译前缀
+（Network-Specific Prefix，NSP）内批量编码裸 IPv4 地址、批量解码规范
+IPv6 映射。前缀仅允许 **`/32`、`/40`、`/48`、`/56`、`/64`、`/96`**，
+且必须显式带前缀长度、主机位为零。
+
+对 `/32`～`/64` 前缀，RFC 6052 把 IPv4 的 32 位安放在第 64 位边界前后，
+映射结构为：
+
+```
+| 前缀 (PL 位) | IPv4 (32 位) | u 八位 (恒 0) | 剩余后缀 (恒 0) |
+```
+
+各长度的后缀位数分别为 56/48/40/32/24；**`/96` 没有 u 八位与后缀**，
+IPv4 的 32 位**直接接在前缀之后**：
+
+| 前缀长度 | IPv4 起始位 | u 八位 | 后缀位数 | 192.0.2.1 映射示例 |
+| -------- | ----------- | ------ | -------- | ------------------ |
+| `/32` | 32 | 有 | 56 | `2001:db8:c000:201::`（前缀 `2001:db8::/32`） |
+| `/40` | 40 | 有 | 48 | `2001:db8:1c0:2:100::`（前缀 `2001:db8:100::/40`） |
+| `/48` | 48 | 有 | 40 | `2001:db8:1:c000:201::`（前缀 `2001:db8:1::/48`） |
+| `/56` | 56 | 有 | 32 | `2001:db8:1:2c0:2:100::`（前缀 `2001:db8:1:200::/56`） |
+| `/64` | 64 | 有 | 24 | `2001:db8:1:2:c000:201::`（前缀 `2001:db8:1:2::/64`） |
+| `/96` | 96 | 无 | 0 | `64:ff9b::c000:201`（知名前缀 `64:ff9b::/96`） |
+
+请求体：
+
+| 字段     | 类型       | 说明                                   |
+| -------- | ---------- | -------------------------------------- |
+| `prefix` | `string`   | **必填**，严格 IPv6 NSP（显式长度、主机位为零），仅 `/32`、`/40`、`/48`、`/56`、`/64`、`/96` |
+| `encode` | `string[]` | 待编码的**裸 IPv4 地址**（不接受 IPv6、不接受 CIDR 记法），可省略（默认 `[]`），顺序即返回顺序 |
+| `decode` | `string[]` | 待解码的**裸 IPv6 地址**（不接受 IPv4、不接受 CIDR 记法），可省略（默认 `[]`），顺序即返回顺序 |
+
+解码时对每个地址校验：必须**位于前缀内**；`/32`～`/64` 时其 **u 八位必须为
+零、剩余后缀必须全部为零**（即必须是由本编码器产生的规范映射）。任一地址
+非法或非规范，**整批返回 422，不返回任何部分结果**。`/96` 只校验前缀归属。
+
+示例（服务默认监听 <http://localhost:8000>）：
+
+```bash
+curl -s -X POST http://localhost:8000/nat64-codec \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "prefix": "2001:db8:1:2::/64",
+        "encode": ["10.0.0.1", "198.51.100.7"],
+        "decode": ["2001:db8:1:2:c633:6407::"]
+      }'
+```
+
+响应（`encoded` / `decoded` 分别与 `encode` / `decode` **等长、同序**）：
+
+```json
+{
+  "encoded": [
+    "2001:db8:1:2:a00:1::",
+    "2001:db8:1:2:c633:6407::"
+  ],
+  "decoded": ["198.51.100.7"]
+}
+```
+
+知名前缀 `64:ff9b::/96`（RFC 6052 第 3.1 节）示例，IPv4 直接接在前缀后：
+
+```bash
+curl -s -X POST http://localhost:8000/nat64-codec \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "prefix": "64:ff9b::/96",
+        "encode": ["192.0.2.1"],
+        "decode": ["64:ff9b::c000:202"]
+      }'
+# {"encoded":["64:ff9b::c000:201"],"decoded":["192.0.2.2"]}
+```
+
+字段说明：
+
+- `encoded`：每个 `encode` IPv4 地址对应的 RFC 6052 IPv6 映射（IPv6 压缩
+  写法），与 `encode` 等长、同序；
+- `decoded`：每个 `decode` IPv6 映射内嵌的点分十进制 IPv4 地址，与
+  `decode` 等长、同序。
+
+非规范映射（u 八位非零）整批返回 422：
+
+```bash
+curl -i -X POST http://localhost:8000/nat64-codec \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "prefix": "2001:db8:1:2::/64",
+        "encode": ["10.0.0.1"],
+        "decode": ["2001:db8:1:2:c000:201:ab00:0"]
+      }'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error","loc":["body"],
+#   "msg":"Value error, 2001:db8:1:2:c000:201:ab00:0 is not a canonical
+#          RFC 6052 mapping for 2001:db8:1:2::/64: the u octet is non-zero", ...}]}
+```
+
+前缀不是允许的六种长度（如 `/47`、`/65`、`/120`）、IPv6 主机位非零、
+裸地址缺前缀长度、IPv4 前缀（如 `10.0.0.0/32`），或 `encode` 中出现
+IPv6/CIDR、`decode` 中出现 IPv4/CIDR/地址不在前缀内/后缀非零，
+统一返回 **HTTP 422**。空批次（只给 `prefix`）合法，返回两个空数组。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -1107,6 +1217,24 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
    独立 $3^n$ 暴力参考实现的随机对拍测试，校验最少改动数、同分方案、违规
    下标与 409 判定。
 
+`/nat64-codec` 是 RFC 6052 的纯位运算映射（`app/policy.py` 中
+`nat64_codec` / `nat64_encode` / `nat64_decode` /
+`parse_nat64_prefix`）：
+
+1. 前缀严格解析为 IPv6 网络（`strict=True` 拒绝主机位、显式长度拒绝裸地址），
+   再校验前缀长度属于 `/32`、`/40`、`/48`、`/56`、`/64`、`/96` 之一；
+2. 编码：把 IPv4 的 32 位整数左移 `96 - PL` 位后与前缀网络地址按位或——
+   IPv4 位正好落在第 PL 位之后；`/96` 移位为 0，即 IPv4 直接接在前缀后；
+   `/32`～`/64` 时移位后 IPv4 下方的 u 八位与后缀位天然为零（前缀主机位已
+   校验为零）；
+3. 解码：先校验地址位于前缀内；`/32`～`/64` 再按 `88 - PL` 定位 u 八位并
+   校验其与更低的后缀全部为零，非规范即报错；最后右移 `96 - PL` 位并取低
+   32 位还原 IPv4（`/96` 只做归属校验，低 32 位即内嵌 IPv4）；
+4. 编码、解码分别按输入顺序逐条处理，结果各自与输入等长；任一地址非法或
+   非规范即抛出异常，由 schema 整批映射为 HTTP 422，不产生部分结果。
+   核心实现另有全部六种前缀长度的 RFC 6052 示例向量与随机 200 地址
+   编码→解码往返对拍测试。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -1131,12 +1259,12 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage、/as-relationship-repair
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区、AS 关系无谷路径最少改动修复（仅 ipaddress + hmac/hashlib）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations、/roa-coverage、/as-relationship-repair、/nat64-codec
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、反向 DNS 委派计划、ROA 覆盖状态前缀树分区、AS 关系无谷路径最少改动修复、RFC 6052 NSP IPv4/IPv6 编解码（仅 ipaddress + hmac/hashlib）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质、/as-relationship-repair 与独立 3^n 暴力参考实现对拍及 409 见证）
-│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝、/as-relationship-repair 共用修正/字典序决胜/422/409/OpenAPI 文档）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 名称拼装与整批校验、/roa-coverage 逐候选 RFC 6483 暴力对拍与 IPv6 超大范围不枚举性质、/as-relationship-repair 与独立 3^n 暴力参考实现对拍及 409 见证、/nat64-codec 六种前缀 RFC 6052 向量与随机往返对拍、u 八位/后缀非规范拒绝）
+│   └── test_api.py    # API 层测试（422、409、统计、空请求等，含 /reverse-delegations 排序/CNAME 覆盖/422 路径、/roa-coverage 三态分区/越界与跨族拒绝、/as-relationship-repair 共用修正/字典序决胜/422/409/OpenAPI 文档、/nat64-codec 六种前缀往返/顺序保持/u 八位与后缀非规范整批 422/OpenAPI 文档）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

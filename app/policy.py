@@ -20,9 +20,11 @@ in-addr.arpa NS records for a /24, RFC 2317 range-label subzones plus
 per-address parent-zone CNAMEs for /25 through /32) and ``roa_coverage``
 (RFC 6483 RPKI ROA valid/invalid/unknown coverage map for every aligned
 candidate route of one prefix length inside one scope, returned as a
-minimal non-overlapping CIDR status partition), and ``as_relationship_repair``
+minimal non-overlapping CIDR status partition), ``as_relationship_repair``
 (minimum-cardinality repair of undirected AS customer-provider/peer
-relationships so every supplied AS path becomes valley-free).
+relationships so every supplied AS path becomes valley-free), and
+``nat64_codec`` (RFC 6052 Network-Specific Prefix IPv4->IPv6 mapping and
+canonical reverse mapping).
 """
 
 from __future__ import annotations
@@ -1850,3 +1852,135 @@ def as_relationship_repair(
         "corrections": corrections,
         "changes": best_cost,
     }
+
+
+# ---------------------------------------------------------------------------
+# nat64-codec: RFC 6052 Network-Specific Prefix IPv4/IPv6 mapping.
+#
+# RFC 6052 Section 2.2 lays out the 128-bit mapped address as
+#
+#   | 0..PL-1        | PL..PL+31      | PL+32..PL+39 | PL+40..127     |
+#   | NSP prefix     | 32 IPv4 bits   | u octet (0)  | suffix (zeros) |
+#
+# for the six NSP lengths 32, 40, 48, 56, 64 (suffix widths 56, 48, 40,
+# 32, 24 bits respectively); the /96 NSP places the IPv4 bits directly
+# after the prefix with no u octet and no suffix.
+# ---------------------------------------------------------------------------
+
+#: NSP prefix lengths allowed by RFC 6052 Section 2.1.
+NAT64_PREFIX_LENGTHS: tuple[int, ...] = (32, 40, 48, 56, 64, 96)
+
+
+def parse_nat64_prefix(value: object) -> ipaddress.IPv6Network:
+    """Parse a strict IPv6 NSP restricted to the RFC 6052 prefix lengths.
+
+    The prefix must carry an explicit length (a bare address is rejected),
+    be IPv6, have zero host bits (``strict=True``) and use one of
+    :data:`NAT64_PREFIX_LENGTHS`.  Any invalid input raises
+    :class:`ValueError`.
+    """
+    network = parse_strict_cidr(value)
+    if not isinstance(network, ipaddress.IPv6Network):
+        raise ValueError(
+            f"NAT64 translation prefix {value!r} must be IPv6, not IPv4"
+        )
+    if network.prefixlen not in NAT64_PREFIX_LENGTHS:
+        allowed = ", ".join(f"/{length}" for length in NAT64_PREFIX_LENGTHS)
+        raise ValueError(
+            f"NAT64 translation prefix {value!r} has prefix /"
+            f"{network.prefixlen}; only {allowed} are accepted (RFC 6052)"
+        )
+    return network
+
+
+def nat64_encode(
+    prefix: ipaddress.IPv6Network,
+    address: ipaddress.IPv4Address,
+) -> ipaddress.IPv6Address:
+    """Embed one IPv4 address into an RFC 6052 NSP.
+
+    The 32 IPv4 bits start right after the prefix; for NSPs shorter than
+    /96 they are followed by the zero u octet and the zero suffix; a /96
+    NSP is followed directly by the IPv4 bits.
+    """
+    value = int(prefix.network_address) | (
+        int(address) << (96 - prefix.prefixlen)
+    )
+    return ipaddress.IPv6Address(value)
+
+
+def nat64_decode(
+    prefix: ipaddress.IPv6Network,
+    address: ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address:
+    """Extract the IPv4 address from one canonical RFC 6052 mapping.
+
+    Raises :class:`ValueError` when the address is outside the prefix or,
+    for NSPs shorter than /96, its u octet or trailing suffix is non-zero
+    (a non-canonical embedding).  A /96 NSP only requires membership.
+    """
+    if address not in prefix:
+        raise ValueError(
+            f"{address} is not inside the NAT64 translation prefix {prefix}"
+        )
+    if prefix.prefixlen < 96:
+        value = int(address)
+        # Layout after the 32 IPv4 bits: one u octet at bit position
+        # 88-PL (..that+7), then 88-PL suffix bits down to bit 0.
+        u_position = 88 - prefix.prefixlen
+        if (value >> u_position) & 0xFF != 0:
+            raise ValueError(
+                f"{address} is not a canonical RFC 6052 mapping for "
+                f"{prefix}: the u octet is non-zero"
+            )
+        suffix_mask = (1 << u_position) - 1
+        if value & suffix_mask != 0:
+            raise ValueError(
+                f"{address} is not a canonical RFC 6052 mapping for "
+                f"{prefix}: the suffix after the u octet is non-zero"
+            )
+    # Encode placed the IPv4 bits at shift 96-PL, so decode shifts the same
+    # amount back down and masks to 32 bits.  For non-/96 NSPs the zero u
+    # octet and zero suffix verified above guarantee the mask is redundant;
+    # a /96 NSP has neither, so membership alone leaves exactly the IPv4
+    # value in the low 32 bits and the mask does the extraction there.
+    return ipaddress.IPv4Address(
+        (int(address) >> (96 - prefix.prefixlen)) & 0xFFFFFFFF
+    )
+
+
+def nat64_codec(
+    prefix_raw: str,
+    encode_raw: Sequence[str],
+    decode_raw: Sequence[str],
+) -> dict:
+    """Encode IPv4 addresses and decode canonical IPv6 mappings under one NSP.
+
+    The prefix is parsed by :func:`parse_nat64_prefix`; each ``encode`` entry
+    must be a bare IPv4 address and each ``decode`` entry a bare IPv6 address
+    (CIDR notation is rejected).  Decoding additionally verifies prefix
+    membership plus the zero u octet and zero suffix, so any non-canonical
+    mapping rejects the whole batch.  Both output lists keep their input order
+    and length.  A malformed value raises :class:`ValueError`.
+    """
+    prefix = parse_nat64_prefix(prefix_raw)
+
+    encoded: list[str] = []
+    for item in encode_raw:
+        address = parse_address(item)
+        if not isinstance(address, ipaddress.IPv4Address):
+            raise ValueError(
+                f"encode entry {item!r} must be an IPv4 address, not IPv6"
+            )
+        encoded.append(str(nat64_encode(prefix, address)))
+
+    decoded: list[str] = []
+    for item in decode_raw:
+        address = parse_address(item)
+        if not isinstance(address, ipaddress.IPv6Address):
+            raise ValueError(
+                f"decode entry {item!r} must be an IPv6 address, not IPv4"
+            )
+        decoded.append(str(nat64_decode(prefix, address)))
+
+    return {"encoded": encoded, "decoded": decoded}
