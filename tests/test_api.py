@@ -2208,3 +2208,131 @@ def test_as_relationship_repair_is_documented_in_openapi():
     assert correction_schema["properties"]["type"]["enum"] == [
         "customer_provider", "peer",
     ]
+
+
+def test_nat64_codec_roundtrip_all_prefix_lengths():
+    for prefix, mapped in [
+        ("2001:db8::/32", "2001:db8:c000:221::"),
+        ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+        ("2001:db8:1::/48", "2001:db8:1:c000:2:2100::"),
+        ("2001:db8:1:100::/56", "2001:db8:1:1c0:0:221::"),
+        ("2001:db8:1:2::/64", "2001:db8:1:2:c0:2:2100:0"),
+        ("2001:db8:1:2::/96", "2001:db8:1:2::c000:221"),
+    ]:
+        response = client.post(
+            "/nat64-codec",
+            json={"prefix": prefix,
+                  "encode": ["192.0.2.33"], "decode": [mapped]},
+        )
+        assert response.status_code == 200, (prefix, response.text)
+        assert response.json() == {
+            "encoded": [mapped], "decoded": ["192.0.2.33"],
+        }
+
+
+def test_nat64_codec_keeps_order_and_equal_length():
+    response = client.post(
+        "/nat64-codec",
+        json={
+            "prefix": "2001:db8::/96",
+            "encode": ["10.0.0.1", "10.0.0.2", "192.0.2.33"],
+            "decode": [
+                "2001:db8::a00:1", "2001:db8::a00:2",
+                "2001:db8::c000:221",
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "encoded": [
+            "2001:db8::a00:1", "2001:db8::a00:2",
+            "2001:db8::c000:221"],
+        "decoded": ["10.0.0.1", "10.0.0.2", "192.0.2.33"],
+    }
+
+
+def test_nat64_codec_empty_lists_accepted():
+    response = client.post(
+        "/nat64-codec", json={"prefix": "2001:db8::/96"})
+    assert response.status_code == 200
+    assert response.json() == {"encoded": [], "decoded": []}
+
+
+def test_nat64_codec_invalid_prefixes_return_422():
+    for prefix in [
+        "2001:db8::/31", "2001:db8::/47", "2001:db8::/65",
+        "2001:db8::/97", "2001:db8::/128", "2001:db8::/0",
+        "2001:db8::1/96", "10.0.0.0/32", "2001:db8::",
+    ]:
+        response = client.post(
+            "/nat64-codec", json={"prefix": prefix})
+        assert response.status_code == 422, prefix
+
+
+def test_nat64_codec_invalid_or_wrong_family_addresses_return_422():
+    cases = [
+        {"prefix": "2001:db8::/96", "encode": ["2001:db8::1"]},
+        {"prefix": "2001:db8::/96", "decode": ["10.0.0.1"]},
+        {"prefix": "2001:db8::/96", "encode": ["10.0.0.1/32"]},
+        {"prefix": "2001:db8::/96", "decode": ["2001:db8::1/128"]},
+        {"prefix": "2001:db8::/96", "encode": ["not-an-ip"]},
+        {"prefix": "2001:db8::/96", "decode": [None]},
+        {"prefix": None, "encode": [], "decode": []},
+    ]
+    for body in cases:
+        response = client.post("/nat64-codec", json=body)
+        assert response.status_code == 422, body
+
+
+@pytest.mark.parametrize("prefix,address", [
+    # non-zero u octet for each straddling prefix length
+    ("2001:db8::/32", "2001:db8:c000:221:ff00::"),
+    ("2001:db8:100::/40", "2001:db8:c0:2:ff21::"),
+    ("2001:db8:1::/48", "2001:db8:0:c000:ff02:2100::"),
+    ("2001:db8:1:100::/56", "2001:db8:0:c0:ff00:221::"),
+    ("2001:db8:1:2::/64", "2001:db8:1:2:ffc0:2:2100:0"),
+    # non-zero suffix
+    ("2001:db8::/32", "2001:db8:c000:221::1"),
+    ("2001:db8:100::/40", "2001:db8:c0:2:21::1"),
+    ("2001:db8:1::/48", "2001:db8:0:c000:2:2100:0:1"),
+    ("2001:db8:1:100::/56", "2001:db8:0:c0:0:221:0:1"),
+    ("2001:db8:1:2::/64", "2001:db8:1:2:c0:2:2100:1"),
+    # outside the translation prefix
+    ("2001:db8::/96", "2001:db9::1"),
+])
+def test_nat64_codec_non_canonical_mappings_return_422(prefix, address):
+    response = client.post(
+        "/nat64-codec", json={"prefix": prefix, "decode": [address]})
+    assert response.status_code == 422, (address, response.text)
+
+
+def test_nat64_codec_slash96_has_no_u_octet_or_suffix():
+    # Bytes 12-15 are all IPv4 under /96: a non-zero byte 8 position is just
+    # part of the embedded IPv4 address and stays valid.
+    response = client.post(
+        "/nat64-codec",
+        json={"prefix": "2001:db8::/96",
+              "decode": ["2001:db8:0:0:0:0:0:c0"]},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"encoded": [], "decoded": ["0.0.0.192"]}
+
+
+def test_nat64_codec_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/nat64-codec" in spec["paths"]
+    operation = spec["paths"]["/nat64-codec"]["post"]
+    assert "200" in operation["responses"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "rfc6052_slash32_roundtrip" in examples
+    assert "slash96_direct_append" in examples
+    assert "non_canonical_suffix_rejected" in examples
+    response_examples = operation["responses"]["200"]["content"][
+        "application/json"
+    ]["examples"]
+    assert "rfc6052_slash32_roundtrip" in response_examples
+    schema = spec["components"]["schemas"]["Nat64CodecResponse"]
+    assert set(schema["properties"]) == {"encoded", "decoded"}

@@ -21,9 +21,11 @@ from app.policy import (
     compare,
     evaluate,
     minimize_policy,
+    nat64_codec,
     normalize,
     parse_address,
     parse_key_hex,
+    parse_nat64_prefix,
     parse_network,
     parse_strict_cidr,
     reverse_delegations,
@@ -2608,3 +2610,133 @@ def test_as_repair_repaired_output_makes_every_path_valid_randomly():
 def test_as_repair_respects_declared_limits():
     assert AS_RELATIONSHIP_LIMIT == 9
     assert AS_PATH_LIMIT == 20
+
+
+# ---------------------------------------------------------------------------
+# nat64-codec: RFC 6052 Network-Specific IPv4/IPv6 translation mapping
+# ---------------------------------------------------------------------------
+
+#: Worked examples from RFC 6052 section 2.4, mapping 192.0.2.33 under each
+#: allowed Network-Specific Prefix length.
+RFC6052_EXAMPLES = {
+    32: ("2001:db8::/32", "2001:db8:c000:221::"),
+    40: ("2001:db8:100::/40", "2001:db8:1c0:2:21::"),
+    48: ("2001:db8:1::/48", "2001:db8:1:c000:2:2100::"),
+    56: ("2001:db8:1:100::/56", "2001:db8:1:1c0:0:221::"),
+    64: ("2001:db8:1:2::/64", "2001:db8:1:2:c0:2:2100:0"),
+    96: ("2001:db8:1:2::/96", "2001:db8:1:2::c000:221"),
+}
+
+
+@pytest.mark.parametrize("length", [32, 40, 48, 56, 64, 96])
+def test_nat64_encode_matches_rfc6052_worked_examples(length):
+    prefix, mapped = RFC6052_EXAMPLES[length]
+    result = nat64_codec(prefix, ["192.0.2.33"], [])
+    assert result == {"encoded": [mapped], "decoded": []}
+
+
+@pytest.mark.parametrize("length", [32, 40, 48, 56, 64, 96])
+def test_nat64_decode_matches_rfc6052_worked_examples(length):
+    prefix, mapped = RFC6052_EXAMPLES[length]
+    result = nat64_codec(prefix, [], [mapped])
+    assert result == {"encoded": [], "decoded": ["192.0.2.33"]}
+
+
+def test_nat64_results_keep_input_order_and_length():
+    v4 = ["0.0.0.0", "255.255.255.255", "192.0.2.33", "10.20.30.40"]
+    prefix = "2001:db8::/48"
+    encoded = nat64_codec(prefix, v4, [])["encoded"]
+    assert len(encoded) == len(v4)
+    decoded = nat64_codec(prefix, [], list(reversed(encoded)))["decoded"]
+    assert decoded == list(reversed(v4))
+    assert nat64_codec(prefix, [], []) == {"encoded": [], "decoded": []}
+
+
+@pytest.mark.parametrize("length", [32, 40, 48, 56, 64, 96])
+def test_nat64_encode_decode_roundtrip_random(length):
+    rng = random.Random(60520000 + length)
+    base = rng.getrandbits(length)
+    prefix = str(ipaddress.IPv6Network((base << (128 - length), length),
+                                       strict=False))
+    addresses = [str(ipaddress.IPv4Address(rng.getrandbits(32)))
+                 for _ in range(32)]
+    encoded = nat64_codec(prefix, addresses, [])["encoded"]
+    assert nat64_codec(prefix, [], encoded)["decoded"] == addresses
+
+
+def test_nat64_embedded_address_uses_zero_u_octet_and_zero_suffix():
+    # 192.0.2.33 under a /32: bytes 4-7 = c0 00 02 21, byte 8 (u) and the
+    # whole remaining suffix are zero.
+    packed = ipaddress.IPv6Address("2001:db8:c000:221::").packed
+    assert packed[4:8] == bytes([0xC0, 0x00, 0x02, 0x21])
+    assert packed[8:] == b"\x00" * 8
+    # /96 keeps no u octet: IPv4 directly follows the 96-bit prefix.
+    packed96 = ipaddress.IPv6Address("2001:db8:1:2::c000:221").packed
+    assert packed96[:12] == bytes.fromhex("20010db80001000200000000")
+    assert packed96[12:] == bytes([0xC0, 0x00, 0x02, 0x21])
+
+
+@pytest.mark.parametrize("length", [32, 40, 48, 56, 64])
+def test_nat64_nonzero_u_octet_rejected(length):
+    rng = random.Random(64 + length)
+    base = rng.getrandbits(length)
+    prefix = ipaddress.IPv6Network((base << (128 - length), length),
+                                   strict=False)
+    mapped = bytearray(
+        ipaddress.IPv6Address(nat64_codec(str(prefix), ["192.0.2.33"], [])[
+            "encoded"][0]).packed
+    )
+    mapped[8] = 0xFF
+    with pytest.raises(ValueError, match="u octet"):
+        nat64_codec(str(prefix), [], [str(ipaddress.IPv6Address(bytes(mapped)))])
+
+
+@pytest.mark.parametrize("length", [32, 40, 48, 56, 64])
+def test_nat64_nonzero_suffix_rejected(length):
+    rng = random.Random(128 + length)
+    base = rng.getrandbits(length)
+    prefix = ipaddress.IPv6Network((base << (128 - length), length),
+                                   strict=False)
+    mapped = bytearray(
+        ipaddress.IPv6Address(nat64_codec(str(prefix), ["192.0.2.33"], [])[
+            "encoded"][0]).packed
+    )
+    mapped[15] = 1
+    with pytest.raises(ValueError, match="suffix"):
+        nat64_codec(str(prefix), [], [str(ipaddress.IPv6Address(bytes(mapped)))])
+
+
+def test_nat64_prefix_mismatch_rejected():
+    with pytest.raises(ValueError, match="does not match"):
+        nat64_codec("2001:db8::/96", [], ["2001:db9::1"])
+    # An address outside a shorter prefix fails too.
+    with pytest.raises(ValueError, match="does not match"):
+        nat64_codec("2001:db8::/32", [], ["2001:db9:c000:221::"])
+
+
+def test_nat64_prefix_validation():
+    for length in (32, 40, 48, 56, 64, 96):
+        network = parse_nat64_prefix(f"2001:db8::/{length}")
+        assert network.prefixlen == length
+    for bad in [
+        "2001:db8::",        # bare address, no prefix length
+        "2001:db8::/31",     # disallowed length
+        "2001:db8::/65",
+        "2001:db8::/128",
+        "2001:db8::1/96",    # host bits set
+        "10.0.0.0/32",       # IPv4
+        "2001:db8::/0",      # host bits on a /0
+    ]:
+        with pytest.raises(ValueError):
+            parse_nat64_prefix(bad)
+
+
+def test_nat64_wrong_family_addresses_rejected():
+    with pytest.raises(ValueError, match="must be IPv4"):
+        nat64_codec("2001:db8::/96", ["2001:db8::1"], [])
+    with pytest.raises(ValueError, match="must be IPv6"):
+        nat64_codec("2001:db8::/96", [], ["10.0.0.1"])
+    with pytest.raises(ValueError):
+        nat64_codec("2001:db8::/96", ["10.0.0.1/32"], [])
+    with pytest.raises(ValueError):
+        nat64_codec("2001:db8::/96", [], ["2001:db8::1/128"])

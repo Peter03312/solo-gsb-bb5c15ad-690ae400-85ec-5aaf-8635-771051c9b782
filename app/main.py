@@ -1,6 +1,7 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
 /audit-rules, /minimize-policy, /allocate, /anonymize,
-/reverse-delegations, /roa-coverage and /as-relationship-repair."""
+/reverse-delegations, /roa-coverage, /as-relationship-repair and
+/nat64-codec."""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from app.policy import (
     compare,
     evaluate,
     minimize_policy,
+    nat64_codec,
     normalize,
     reverse_delegations,
     roa_coverage,
@@ -33,6 +35,8 @@ from app.schemas import (
     EvaluateRequest,
     MinimizePolicyRequest,
     MinimizePolicyResponse,
+    Nat64CodecRequest,
+    Nat64CodecResponse,
     NormalizeResponse,
     PolicyRequest,
     ReverseDelegationsRequest,
@@ -61,9 +65,11 @@ app = FastAPI(
         "prefix length inside a scope as a minimal CIDR status partition; "
         "and repair the minimum number of undirected AS customer-provider/"
         "peer relationships so every supplied origin-to-receiver AS path is "
-        "valley-free (up*, at most one peer, down*)."
+        "valley-free (up*, at most one peer, down*); and embed/extract IPv4 "
+        "addresses in/from mapped IPv6 addresses per the RFC 6052 "
+        "Network-Specific IPv4/IPv6 translation layout."
     ),
-    version="1.9.0",
+    version="1.10.0",
 )
 
 
@@ -1087,3 +1093,88 @@ def repair_as_relationships(request: AsRelationshipRepairRequest) -> dict:
             ),
         )
     return result
+
+
+@app.post(
+    "/nat64-codec",
+    response_model=Nat64CodecResponse,
+    tags=["policy"],
+    summary="RFC 6052 IPv4-in-IPv6 encode/decode under one translation prefix",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "rfc6052_slash32_roundtrip": {
+                            "summary": (
+                                "/32 prefix: the IPv4 bits straddle the bit-64 "
+                                "boundary around the zero u octet"
+                            ),
+                            "value": {
+                                "prefix": "2001:db8::/32",
+                                "encode": ["192.0.2.33", "198.51.100.7"],
+                                "decode": [
+                                    "2001:db8:c000:221::",
+                                    "2001:db8:c633:6407::",
+                                ],
+                            },
+                        },
+                        "slash96_direct_append": {
+                            "summary": "/96 prefix: IPv4 follows the prefix directly",
+                            "value": {
+                                "prefix": "2001:db8:1:2::/96",
+                                "encode": ["192.0.2.33"],
+                                "decode": ["2001:db8:1:2::c000:221"],
+                            },
+                        },
+                        "non_canonical_suffix_rejected": {
+                            "summary": "Non-zero suffix bits in a /32 decode address -> HTTP 422",
+                            "value": {
+                                "prefix": "2001:db8::/32",
+                                "encode": [],
+                                "decode": ["2001:db8:c000:221::1"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "One mapped IPv6 address per encode input and one embedded "
+                "IPv4 address per decode input, each list in input order."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "rfc6052_slash32_roundtrip": {
+                            "summary": "Encode and decode lists keep input order",
+                            "value": {
+                                "encoded": [
+                                    "2001:db8:c000:221::",
+                                    "2001:db8:c633:6407::",
+                                ],
+                                "decoded": ["192.0.2.33", "198.51.100.7"],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "The prefix is not a strict IPv6 CIDR of /32, /40, /48, /56, "
+                "/64 or /96, an encode entry is not a bare IPv4 address, a "
+                "decode entry is not a bare IPv6 address, or a decode "
+                "address is not a canonical RFC 6052 mapping (prefix mismatch, "
+                "non-zero u octet or non-zero suffix)."
+            ),
+        },
+    },
+)
+def nat64_translate(request: Nat64CodecRequest) -> dict:
+    return nat64_codec(request.prefix, request.encode, request.decode)
